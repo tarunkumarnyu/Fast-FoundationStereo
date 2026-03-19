@@ -11,3 +11,7 @@ weights/*
 !weights/.gitkeep
 output/
 .claude/
+# TRT engines are hardware-specific — rebuild per device
+engines/**/*.engine
+# ONNX data files (large)
+engines/**/*.onnx.data
