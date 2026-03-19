@@ -184,8 +184,8 @@ class LiveFFSFused(Node):
         ffs_flat = ffs_disp.reshape(-1)
         da2_flat = da2_raw.reshape(-1)
 
-        # Valid: FFS has good stereo AND DA2 is positive (close objects)
-        valid = (ffs_flat > 2.0) & (da2_flat > 1.0)
+        # Valid: FFS has good stereo AND DA2 is positive
+        valid = (ffs_flat > 2.0) & (da2_flat > 0.01)
         if valid.sum() < 100:
             return
 
@@ -256,11 +256,16 @@ class LiveFFSFused(Node):
 
             # === DA2 monocular (runs on left IR) ===
             ir_gpu = resized[0, 0]  # (H, W) float32
-            da2_rel = self.da2.predict(ir_gpu)
+            da2_raw = self.da2.predict(ir_gpu)
             # Resize DA2 output to FFS resolution
-            da2_rel = F.interpolate(da2_rel.unsqueeze(0).unsqueeze(0),
+            da2_raw = F.interpolate(da2_raw.unsqueeze(0).unsqueeze(0),
                                      size=(self.H, self.W), mode='bilinear',
                                      align_corners=False).squeeze()
+            # Normalize DA2 to [0, 1] range — clamp negatives, scale by max
+            da2_rel = da2_raw.clamp(min=0)
+            da2_max = da2_rel.max()
+            if da2_max > 0:
+                da2_rel = da2_rel / da2_max  # now 0-1, high=close
 
             if ffs_disp is None:
                 continue
@@ -269,53 +274,42 @@ class LiveFFSFused(Node):
 
             # === Calibration phase ===
             if self.frozen_coeffs is None:
+                if self.calib_count == 0:
+                    self.get_logger().info(
+                        f'FFS disp: min={ffs_disp.min():.1f} max={ffs_disp.max():.1f} mean={ffs_disp.mean():.1f} | '
+                        f'DA2 raw: min={da2_rel.min():.1f} max={da2_rel.max():.1f} mean={da2_rel.mean():.1f}')
                 self._calibrate_frame(ffs_disp, da2_rel)
                 if self.calib_count >= self.calib_frames:
                     self._freeze_calibration()
-                # During calibration, just use FFS directly
+                # During calibration, use FFS with fixed range viz
                 disp_2d = ffs_disp.clamp(min=0.5)
             else:
                 # === Fused mode: FFS primary, DA2 fills holes ===
-                # DA2 output is already disparity-like (high=close) — apply polynomial directly
                 da2_clamped = da2_rel.clamp(min=0.0)
                 c, b, a = self.frozen_coeffs[0], self.frozen_coeffs[1], self.frozen_coeffs[2]
                 da2_aligned = a * da2_clamped ** 2 + b * da2_clamped + c
-                da2_aligned = da2_aligned.clamp(min=0.5)
+                da2_aligned = da2_aligned.clamp(min=0.5, max=96.0)
 
-                # FFS is primary — DA2 only fills where FFS has holes (disp < 2)
+                # FFS primary (80%), DA2 fills holes where stereo fails
                 ffs_valid = ffs_disp > 2.0
                 disp_2d = torch.where(ffs_valid, ffs_disp, da2_aligned)
 
-            # === Guided filter (r=1, IR-guided) ===
+            # === Simple 5x5 box blur ===
             disp_4d = disp_2d.unsqueeze(0).unsqueeze(0)
-            ir_4d = ir_gpu.unsqueeze(0).unsqueeze(0)
-            r, ks = 1, 3
-            eps_gf = 200.0
-            mean_I = F.avg_pool2d(ir_4d, ks, stride=1, padding=r)
-            mean_p = F.avg_pool2d(disp_4d, ks, stride=1, padding=r)
-            mean_Ip = F.avg_pool2d(ir_4d * disp_4d, ks, stride=1, padding=r)
-            cov_Ip = mean_Ip - mean_I * mean_p
-            mean_II = F.avg_pool2d(ir_4d * ir_4d, ks, stride=1, padding=r)
-            var_I = mean_II - mean_I * mean_I
-            ag = cov_Ip / (var_I + eps_gf)
-            bg = mean_p - ag * mean_I
-            mean_a = F.avg_pool2d(ag, ks, stride=1, padding=r)
-            mean_b = F.avg_pool2d(bg, ks, stride=1, padding=r)
-            disp_2d = (mean_a * ir_4d + mean_b).squeeze()
+            disp_4d = F.avg_pool2d(disp_4d, kernel_size=5, stride=1, padding=2)
+            disp_2d = disp_4d.squeeze()
 
-            # === Temporal smoothing (motion-adaptive) ===
+            # === Temporal smoothing ===
             if self.prev_disp is None:
                 self.prev_disp = disp_2d.clone()
             else:
-                diff = (disp_2d - self.prev_disp).abs()
-                alpha = torch.where(diff > 5.0, torch.ones_like(diff), torch.full_like(diff, 0.4))
-                self.prev_disp.mul_(1.0 - alpha).add_(disp_2d * alpha)
+                self.prev_disp.mul_(0.3).add_(disp_2d, alpha=0.7)
             disp_2d = self.prev_disp
 
-            # === Grayscale viz: close=dark, far=white ===
+            # === Grayscale viz: fixed range using engine max_disp ===
             stamp = self.get_clock().now().to_msg()
-            d_near, d_far = 80.0, 3.0
-            normalized = 1.0 - ((disp_2d - d_far) / (d_near - d_far)).clamp(0, 1)
+            d_max = 96.0  # engine max_disp
+            normalized = 1.0 - (disp_2d / d_max).clamp(0, 1)
             gray = (normalized * 255.0).to(torch.uint8).cpu().numpy()
 
             _, jpeg = cv2.imencode('.jpg', gray, [cv2.IMWRITE_JPEG_QUALITY, 75])

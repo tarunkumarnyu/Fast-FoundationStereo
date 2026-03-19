@@ -164,54 +164,30 @@ class LiveFFS(Node):
             if disp is None:
                 continue
 
-            # === Post-processing: Saviolo-style filtering (arXiv:2409.11962) ===
+            # === Post-processing ===
             disp_2d = disp.cuda().reshape(self.H, self.W).float()
 
-            # 1. GPU morphological opening (replaces CPU speckle filter — same effect, no roundtrip)
-            #    Erode removes isolated noise pixels, dilate restores object shapes
-            disp_4d = disp_2d.unsqueeze(0).unsqueeze(0)
-            disp_4d = -F.max_pool2d(-disp_4d, kernel_size=3, stride=1, padding=1)  # erode
-            disp_4d = F.max_pool2d(disp_4d, kernel_size=3, stride=1, padding=1)    # dilate
-            disp_2d = disp_4d.squeeze()
-
-            # 2. Clamp invalid disparities
+            # 1. Clamp invalid disparities
             disp_2d = disp_2d.clamp(min=0.5)
 
-            # 3. GPU guided filter — edge-preserving smoothing using IR as guide
-            #    (matching Saviolo's guided_filter: smooth depth noise, preserve edges)
-            ir_gpu = resized[0, 0]  # left IR at network resolution
+            # 2. Simple 5x5 box blur — fast spatial denoising without darkening
             disp_4d = disp_2d.unsqueeze(0).unsqueeze(0)
-            ir_4d = ir_gpu.unsqueeze(0).unsqueeze(0)
-            r = 1  # radius (small = fast, still edge-preserving)
-            ks = 2 * r + 1
-            eps_gf = 200.0  # guided filter regularization (higher = more smoothing)
+            disp_4d = F.avg_pool2d(disp_4d, kernel_size=5, stride=1, padding=2)
+            disp_2d = disp_4d.squeeze()
 
-            mean_I = F.avg_pool2d(ir_4d, ks, stride=1, padding=r)
-            mean_p = F.avg_pool2d(disp_4d, ks, stride=1, padding=r)
-            mean_Ip = F.avg_pool2d(ir_4d * disp_4d, ks, stride=1, padding=r)
-            cov_Ip = mean_Ip - mean_I * mean_p
-            mean_II = F.avg_pool2d(ir_4d * ir_4d, ks, stride=1, padding=r)
-            var_I = mean_II - mean_I * mean_I
-            a = cov_Ip / (var_I + eps_gf)
-            b = mean_p - a * mean_I
-            mean_a = F.avg_pool2d(a, ks, stride=1, padding=r)
-            mean_b = F.avg_pool2d(b, ks, stride=1, padding=r)
-            disp_2d = (mean_a * ir_4d + mean_b).squeeze()
-
-            # 4. Simple temporal smoothing — always blend, never skip
-            #    High alpha = responsive, low alpha = smooth
+            # 3. Temporal smoothing — 70% current, 30% previous
             if prev_disp is None:
                 prev_disp = disp_2d.clone()
             else:
                 prev_disp.mul_(0.3).add_(disp_2d, alpha=0.7)
             disp_2d = prev_disp
 
-            # 5. Continuous grayscale: close=dark, far=white (inverse disparity mapping)
-            #    Clamp disparity range and map smoothly
+            # 5. Fixed-range grayscale: close=dark, far=white
+            #    Uses engine max_disp as the full range
             stamp = self.get_clock().now().to_msg()
-            d_near = 80.0   # disparity for nearest objects (~0.5m)
-            d_far = 3.0     # disparity for farthest visible (~15m)
-            normalized = 1.0 - ((disp_2d - d_far) / (d_near - d_far)).clamp(0, 1)
+            d_max = 128.0  # max_disp from engine config (480x320=128, 320x224=96)
+            # Invert: high disp (close) = dark(0), low disp (far) = white(255)
+            normalized = 1.0 - (disp_2d / d_max).clamp(0, 1)
             gray = (normalized * 255.0).to(torch.uint8).cpu().numpy()
 
             # Single JPEG encode + publish
