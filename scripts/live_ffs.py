@@ -198,18 +198,12 @@ class LiveFFS(Node):
             mean_b = F.avg_pool2d(b, ks, stride=1, padding=r)
             disp_2d = (mean_a * ir_4d + mean_b).squeeze()
 
-            # 4. Motion-adaptive temporal smoothing — per-pixel alpha
-            #    Fast motion → use current frame entirely (no ghosting)
-            #    Static → smooth heavily (stable depth)
+            # 4. Simple temporal smoothing — always blend, never skip
+            #    High alpha = responsive, low alpha = smooth
             if prev_disp is None:
                 prev_disp = disp_2d.clone()
             else:
-                diff = (disp_2d - prev_disp).abs()
-                # Per-pixel: if change > 5 disp units → full reset to current frame
-                motion_alpha = torch.where(diff > 5.0,
-                    torch.ones_like(diff),
-                    torch.full_like(diff, 0.4))
-                prev_disp.mul_(1.0 - motion_alpha).add_(disp_2d * motion_alpha)
+                prev_disp.mul_(0.3).add_(disp_2d, alpha=0.7)
             disp_2d = prev_disp
 
             # 5. Continuous grayscale: close=dark, far=white (inverse disparity mapping)
