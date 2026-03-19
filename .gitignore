@@ -13,5 +13,6 @@ output/
 .claude/
 # TRT engines are hardware-specific — rebuild per device
 engines/**/*.engine
-# ONNX data files (large)
+# ONNX files (large, regenerate with make_onnx.py)
+engines/**/*.onnx
 engines/**/*.onnx.data
