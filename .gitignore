@@ -15,4 +15,5 @@ output/
 engines/**/*.engine
 # ONNX files (large, regenerate with make_onnx.py)
 engines/**/*.onnx
-engines/**/*.onnx.data
+engines/**/*.onnx.datacpp/log/
+cpp/ffs_cpp.log
