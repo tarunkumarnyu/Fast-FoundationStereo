@@ -134,7 +134,7 @@ class LiveFFS(Node):
         alpha = 0.08
         # Temporal EMA on disparity — stabilizes depth for obstacle avoidance
         prev_disp = None
-        temporal_alpha = 0.6  # 0.0=full smoothing, 1.0=no smoothing
+        temporal_alpha = 0.5  # 0.0=full smoothing, 1.0=no smoothing
 
         while self.running:
             self.new_frame.wait(timeout=0.1)
@@ -164,42 +164,61 @@ class LiveFFS(Node):
             if disp is None:
                 continue
 
-            # === GPU post-processing ===
+            # === Post-processing: Saviolo-style filtering (arXiv:2409.11962) ===
             disp_2d = disp.cuda().reshape(self.H, self.W).float()
 
-            # Temporal EMA smoothing on GPU — stabilizes depth between frames
+            # 1. GPU morphological opening (replaces CPU speckle filter — same effect, no roundtrip)
+            #    Erode removes isolated noise pixels, dilate restores object shapes
+            disp_4d = disp_2d.unsqueeze(0).unsqueeze(0)
+            disp_4d = -F.max_pool2d(-disp_4d, kernel_size=3, stride=1, padding=1)  # erode
+            disp_4d = F.max_pool2d(disp_4d, kernel_size=3, stride=1, padding=1)    # dilate
+            disp_2d = disp_4d.squeeze()
+
+            # 2. Clamp invalid disparities
+            disp_2d = disp_2d.clamp(min=0.5)
+
+            # 3. GPU guided filter — edge-preserving smoothing using IR as guide
+            #    (matching Saviolo's guided_filter: smooth depth noise, preserve edges)
+            ir_gpu = resized[0, 0]  # left IR at network resolution
+            disp_4d = disp_2d.unsqueeze(0).unsqueeze(0)
+            ir_4d = ir_gpu.unsqueeze(0).unsqueeze(0)
+            r = 1  # radius (small = fast, still edge-preserving)
+            ks = 2 * r + 1
+            eps_gf = 200.0  # guided filter regularization (higher = more smoothing)
+
+            mean_I = F.avg_pool2d(ir_4d, ks, stride=1, padding=r)
+            mean_p = F.avg_pool2d(disp_4d, ks, stride=1, padding=r)
+            mean_Ip = F.avg_pool2d(ir_4d * disp_4d, ks, stride=1, padding=r)
+            cov_Ip = mean_Ip - mean_I * mean_p
+            mean_II = F.avg_pool2d(ir_4d * ir_4d, ks, stride=1, padding=r)
+            var_I = mean_II - mean_I * mean_I
+            a = cov_Ip / (var_I + eps_gf)
+            b = mean_p - a * mean_I
+            mean_a = F.avg_pool2d(a, ks, stride=1, padding=r)
+            mean_b = F.avg_pool2d(b, ks, stride=1, padding=r)
+            disp_2d = (mean_a * ir_4d + mean_b).squeeze()
+
+            # 4. Motion-adaptive temporal smoothing — per-pixel alpha
+            #    Fast motion → use current frame entirely (no ghosting)
+            #    Static → smooth heavily (stable depth)
             if prev_disp is None:
                 prev_disp = disp_2d.clone()
             else:
-                # Blend: new = alpha*current + (1-alpha)*previous
-                prev_disp.mul_(1.0 - temporal_alpha).add_(disp_2d, alpha=temporal_alpha)
+                diff = (disp_2d - prev_disp).abs()
+                # Per-pixel: if change > 5 disp units → full reset to current frame
+                motion_alpha = torch.where(diff > 5.0,
+                    torch.ones_like(diff),
+                    torch.full_like(diff, 0.4))
+                prev_disp.mul_(1.0 - motion_alpha).add_(disp_2d * motion_alpha)
             disp_2d = prev_disp
 
-            # GPU box blur (3x3) for spatial denoising — very fast on GPU
-            disp_4d = disp_2d.unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
-            disp_4d = F.avg_pool2d(disp_4d, kernel_size=3, stride=1, padding=1)
-            disp_2d = disp_4d.squeeze()
-
-            # Fast approximate percentile: fixed stride subsample (deterministic, no flicker)
-            flat = disp_2d.reshape(-1)
-            step = max(1, flat.shape[0] // 1024)
-            sample = flat[::step]
-            sorted_sample = torch.sort(sample).values
-            n = sorted_sample.shape[0]
-            dmin_cur = float(sorted_sample[n // 50])      # ~2nd percentile
-            dmax_cur = float(sorted_sample[n - n // 50])   # ~98th percentile
-
-            smooth_min = smooth_min + alpha * (dmin_cur - smooth_min)
-            smooth_max = smooth_max + alpha * (dmax_cur - smooth_max)
-
-            rng = smooth_max - smooth_min
+            # 5. Continuous grayscale: close=dark, far=white (inverse disparity mapping)
+            #    Clamp disparity range and map smoothly
             stamp = self.get_clock().now().to_msg()
-
-            if rng > 0.1:
-                # GPU normalize to grayscale
-                gray = ((disp_2d - smooth_min) * (255.0 / rng)).clamp(0, 255).to(torch.uint8).cpu().numpy()
-            else:
-                gray = np.zeros((self.H, self.W), dtype=np.uint8)
+            d_near = 80.0   # disparity for nearest objects (~0.5m)
+            d_far = 3.0     # disparity for farthest visible (~15m)
+            normalized = 1.0 - ((disp_2d - d_far) / (d_near - d_far)).clamp(0, 1)
+            gray = (normalized * 255.0).to(torch.uint8).cpu().numpy()
 
             # Single JPEG encode + publish
             _, jpeg_g = cv2.imencode('.jpg', gray, [cv2.IMWRITE_JPEG_QUALITY, 75])
