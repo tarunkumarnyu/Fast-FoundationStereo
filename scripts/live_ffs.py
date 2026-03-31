@@ -182,13 +182,23 @@ class LiveFFS(Node):
                 prev_disp.mul_(0.3).add_(disp_2d, alpha=0.7)
             disp_2d = prev_disp
 
-            # 5. Fixed-range grayscale: close=dark, far=white
-            #    Uses engine max_disp as the full range
+            # 5. Percentile-based grayscale with EMA-smoothed bounds
             stamp = self.get_clock().now().to_msg()
-            d_max = 128.0  # max_disp from engine config (480x320=128, 320x224=96)
-            # Invert: high disp (close) = dark(0), low disp (far) = white(255)
-            normalized = 1.0 - (disp_2d / d_max).clamp(0, 1)
-            gray = (normalized * 255.0).to(torch.uint8).cpu().numpy()
+            flat = disp_2d.reshape(-1)
+            step = max(1, flat.shape[0] // 1024)
+            sample = flat[::step]
+            sorted_s = torch.sort(sample).values
+            n = sorted_s.shape[0]
+            d_lo = float(sorted_s[max(0, n // 50)])
+            d_hi = float(sorted_s[min(n - 1, n - n // 50)])
+            smooth_min = smooth_min + alpha * (d_lo - smooth_min)
+            smooth_max = smooth_max + alpha * (d_hi - smooth_max)
+            rng = smooth_max - smooth_min
+            if rng > 0.5:
+                gray = ((disp_2d - smooth_min) / rng).clamp(0, 1)
+                gray = (gray * 255.0).to(torch.uint8).cpu().numpy()
+            else:
+                gray = np.full((self.H, self.W), 128, dtype=np.uint8)
 
             # Single JPEG encode + publish
             _, jpeg_g = cv2.imencode('.jpg', gray, [cv2.IMWRITE_JPEG_QUALITY, 75])

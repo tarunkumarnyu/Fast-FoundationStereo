@@ -5,41 +5,31 @@
 
 namespace fast_ffs {
 
-// Preprocess: uint8 grayscale → float32 3-channel, with bilinear resize
+// Preprocess: uint8 grayscale → float32 3-channel NCHW, with bilinear resize
 void preprocess_gpu(
     const uint8_t* src,  // device, (src_h, src_w) uint8
-    float* dst,          // device, (1, 3, dst_h, dst_w) float NCHW
+    float* dst,          // device, (1, 3, dst_h, dst_w) float32 NCHW
     int src_h, int src_w,
     int dst_h, int dst_w,
     cudaStream_t stream);
 
-// GWC volume: group-wise correlation between left/right features
-// Input features: (1, C, H, W) fp16 NCHW
-// Output: (1, num_groups, max_disp, H, W) fp16
-void build_gwc_volume(
-    const __half* feat_left,   // (1, C, H, W)
-    const __half* feat_right,  // (1, C, H, W)
-    __half* gwc_out,           // (1, G, D, H, W)
-    __half* workspace,         // temp: 2 * H*W*C halfs for NHWC permute
-    int C, int H, int W,
-    int max_disp, int num_groups,
-    cudaStream_t stream);
-
-// Box blur 5x5 in-place
+// Box blur 5x5 (writes result back into data via temp buffer)
 void box_blur_5x5(float* data, float* temp, int H, int W, cudaStream_t stream);
 
-// Temporal EMA + normalize to uint8 (fused)
-void temporal_normalize(
-    float* prev,        // (H, W) persistent EMA buffer
-    const float* cur,   // (H, W) current disparity
-    uint8_t* out,       // (H, W) output grayscale
-    int H, int W,
-    float ema_alpha,    // 0.7 = trust current 70%
-    float d_max,        // max disparity for normalization
-    bool first_frame,   // if true, copy cur→prev instead of blend
-    cudaStream_t stream);
+// Convert fp16 → float32
+void half_to_float(const __half* src, float* dst, int N, cudaStream_t stream);
 
-// Workspace size needed for GWC
-size_t gwc_workspace_bytes(int C, int H, int W);
+// Temporal EMA with NaN guard and clamp.
+// prev = (1-alpha)*prev + alpha*clamp(cur, clamp_min)
+// NaN in cur is replaced with prev value (or clamp_min on first frame).
+// If first_frame, prev = clamp(cur, clamp_min).
+void temporal_ema(
+    float* prev,        // (N) persistent EMA buffer, updated in-place
+    const float* cur,   // (N) current disparity
+    int N,
+    float alpha,        // 0.7 = trust current 70%
+    float clamp_min,    // minimum disparity value (0.5)
+    bool first_frame,
+    cudaStream_t stream);
 
 }  // namespace fast_ffs
