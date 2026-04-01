@@ -12,6 +12,7 @@ find_package(std_msgs REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(CUDAToolkit REQUIRED)
 find_package(yaml-cpp REQUIRED)
+find_package(message_filters REQUIRED)
 
 # TensorRT
 find_library(NVINFER nvinfer PATHS /usr/lib/aarch64-linux-gnu)
@@ -38,7 +39,7 @@ target_link_libraries(live_ffs_node
 )
 
 ament_target_dependencies(live_ffs_node
-  rclcpp sensor_msgs std_msgs
+  rclcpp sensor_msgs std_msgs message_filters
 )
 
 install(TARGETS live_ffs_node DESTINATION lib/${PROJECT_NAME})

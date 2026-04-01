@@ -16,6 +16,9 @@ void preprocess_gpu(
 // Box blur 5x5 (writes result back into data via temp buffer)
 void box_blur_5x5(float* data, float* temp, int H, int W, cudaStream_t stream);
 
+// Box blur 3x3 (writes result back into data via temp buffer)
+void box_blur_3x3(float* data, float* temp, int H, int W, cudaStream_t stream);
+
 // Convert fp16 → float32
 void half_to_float(const __half* src, float* dst, int N, cudaStream_t stream);
 

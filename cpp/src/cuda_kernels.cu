@@ -75,6 +75,36 @@ void box_blur_5x5(float* data, float* temp, int H, int W, cudaStream_t stream) {
   cudaMemcpyAsync(data, temp, H * W * sizeof(float), cudaMemcpyDeviceToDevice, stream);
 }
 
+__global__ void box_blur_3x3_kernel(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    int H, int W)
+{
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= W || y >= H) return;
+
+  float sum = 0.0f;
+  int count = 0;
+  for (int dy = -1; dy <= 1; ++dy) {
+    for (int dx = -1; dx <= 1; ++dx) {
+      int ny = y + dy, nx = x + dx;
+      if (ny >= 0 && ny < H && nx >= 0 && nx < W) {
+        sum += src[ny * W + nx];
+        ++count;
+      }
+    }
+  }
+  dst[y * W + x] = sum / count;
+}
+
+void box_blur_3x3(float* data, float* temp, int H, int W, cudaStream_t stream) {
+  dim3 block(16, 16);
+  dim3 grid((W + 15) / 16, (H + 15) / 16);
+  box_blur_3x3_kernel<<<grid, block, 0, stream>>>(data, temp, H, W);
+  cudaMemcpyAsync(data, temp, H * W * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+}
+
 // ============================================================
 // fp16 → float32
 // ============================================================

@@ -19,6 +19,8 @@
 #include <sensor_msgs/msg/compressed_image.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/point_field.hpp>
+#include <message_filters/subscriber.h>
+#include <message_filters/time_synchronizer.h>
 
 #include <opencv2/imgcodecs.hpp>
 #include <cuda_runtime.h>
@@ -103,14 +105,14 @@ public:
     // Warmup
     warmup();
 
-    // ROS2 subscribers
+    // ROS2 subscribers — time-synchronized stereo pair
     auto qos = rclcpp::QoS(1).best_effort();
-    sub_left_ = create_subscription<sensor_msgs::msg::Image>(
-        ns + "/infra1/image_rect_raw", qos,
-        [this](sensor_msgs::msg::Image::SharedPtr msg) { cb_left(msg); });
-    sub_right_ = create_subscription<sensor_msgs::msg::Image>(
-        ns + "/infra2/image_rect_raw", qos,
-        [this](sensor_msgs::msg::Image::SharedPtr msg) { cb_right(msg); });
+    sub_left_.subscribe(this, ns + "/infra1/image_rect_raw", qos.get_rmw_qos_profile());
+    sub_right_.subscribe(this, ns + "/infra2/image_rect_raw", qos.get_rmw_qos_profile());
+    sync_ = std::make_shared<message_filters::TimeSynchronizer<
+        sensor_msgs::msg::Image, sensor_msgs::msg::Image>>(sub_left_, sub_right_, 2);
+    sync_->registerCallback(std::bind(&LiveFfsNode::cb_stereo, this,
+        std::placeholders::_1, std::placeholders::_2));
 
     // Publishers
     auto pub_qos = rclcpp::QoS(1).reliable();
@@ -143,56 +145,65 @@ public:
   }
 
 private:
-  void cb_left(sensor_msgs::msg::Image::SharedPtr msg) {
+  void cb_stereo(const sensor_msgs::msg::Image::ConstSharedPtr& left_msg,
+                 const sensor_msgs::msg::Image::ConstSharedPtr& right_msg) {
     if (input_h_ == 0) {
-      input_h_ = msg->height;
-      input_w_ = msg->width;
+      input_h_ = left_msg->height;
+      input_w_ = left_msg->width;
       if (input_h_ * input_w_ != 480 * 848) {
         cudaFreeHost(pin_left_); cudaFreeHost(pin_right_);
+        cudaFreeHost(snap_left_); cudaFreeHost(snap_right_);
         cudaFree(gpu_left_raw_); cudaFree(gpu_right_raw_);
         cudaMallocHost(&pin_left_, input_h_ * input_w_);
         cudaMallocHost(&pin_right_, input_h_ * input_w_);
+        cudaMallocHost(&snap_left_, input_h_ * input_w_);
+        cudaMallocHost(&snap_right_, input_h_ * input_w_);
         cudaMalloc(&gpu_left_raw_, input_h_ * input_w_);
         cudaMalloc(&gpu_right_raw_, input_h_ * input_w_);
       }
       RCLCPP_INFO(get_logger(), "Input: %dx%d", input_w_, input_h_);
     }
-    std::memcpy(pin_left_, msg->data.data(), msg->data.size());
-    has_left_ = true;
+    {
+      std::lock_guard<std::mutex> lock(mtx_);
+      std::memcpy(pin_left_, left_msg->data.data(), left_msg->data.size());
+      std::memcpy(pin_right_, right_msg->data.data(), right_msg->data.size());
+      stereo_seq_++;
+    }
     frame_cv_.notify_one();
   }
 
-  void cb_right(sensor_msgs::msg::Image::SharedPtr msg) {
-    if (input_h_ == 0) return;
-    std::memcpy(pin_right_, msg->data.data(), msg->data.size());
-    has_right_ = true;
-  }
-
   void infer_loop() {
-    auto t_start = std::chrono::steady_clock::now();
+    auto t_window_start = std::chrono::steady_clock::now();
     int N = H_ * W_;
 
     // Accumulate stage timings for averaging
     float stage_accum[NUM_EVENTS] = {};
     int profile_count = 0;
 
+    uint64_t last_seq = 0;
+
     while (running_) {
-      // Wait for stereo pair
+      // Wait for a NEW synced stereo pair (frame-drop: always process latest only)
       {
         std::unique_lock<std::mutex> lock(mtx_);
-        frame_cv_.wait_for(lock, 100ms, [this] {
-          return has_left_.load() && has_right_.load();
+        frame_cv_.wait_for(lock, 100ms, [this, &last_seq] {
+          return (stereo_seq_ > last_seq) || !running_;
         });
+        if (!running_) break;
+        if (stereo_seq_ <= last_seq) continue;
+        last_seq = stereo_seq_;
+        // Snapshot pinned buffers under lock so callback can't overwrite mid-H2D
+        std::memcpy(snap_left_, pin_left_, input_h_ * input_w_);
+        std::memcpy(snap_right_, pin_right_, input_h_ * input_w_);
       }
-      if (!has_left_ || !has_right_) continue;
 
       // === EVENT 0: start ===
       cudaEventRecord(events_[0], stream_);
 
-      // H2D
-      cudaMemcpyAsync(gpu_left_raw_, pin_left_, input_h_ * input_w_,
+      // H2D from snapshot (lock-free)
+      cudaMemcpyAsync(gpu_left_raw_, snap_left_, input_h_ * input_w_,
                        cudaMemcpyHostToDevice, stream_);
-      cudaMemcpyAsync(gpu_right_raw_, pin_right_, input_h_ * input_w_,
+      cudaMemcpyAsync(gpu_right_raw_, snap_right_, input_h_ * input_w_,
                        cudaMemcpyHostToDevice, stream_);
       cudaEventRecord(events_[1], stream_);
 
@@ -227,18 +238,14 @@ private:
       }
       cudaEventRecord(events_[5], stream_);
 
-      // Box blur 5x5
-      fast_ffs::box_blur_5x5(disp_f32_, blur_temp_, H_, W_, stream_);
+      // Box blur disabled — raw disparity
       cudaEventRecord(events_[6], stream_);
 
-      // Temporal EMA (NaN-safe)
-      fast_ffs::temporal_ema(ema_buf_, disp_f32_, N, 0.7f, 0.5f,
-                              first_frame_, stream_);
-      first_frame_ = false;
+      // EMA disabled — pass through
       cudaEventRecord(events_[7], stream_);
 
       // D2H + sync
-      cudaMemcpyAsync(disp_host_, ema_buf_, N * sizeof(float),
+      cudaMemcpyAsync(disp_host_, disp_f32_, N * sizeof(float),
                        cudaMemcpyDeviceToHost, stream_);
       cudaStreamSynchronize(stream_);
       cudaEventRecord(events_[8], stream_);
@@ -334,14 +341,17 @@ private:
 
       // Stats
       frame_count_++;
+      int64_t dropped = (int64_t)last_seq - (int64_t)frame_count_;  // approximate synced pairs skipped
+      auto now_tp = std::chrono::steady_clock::now();
       if (frame_count_ % 30 == 0) {
-        double elapsed = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - t_start).count();
-        double fps = frame_count_ / elapsed;
+        double window_sec = std::chrono::duration<double>(now_tp - t_window_start).count();
+        double fps = 30.0 / window_sec;  // instantaneous over last 30 frames
+        t_window_start = now_tp;
         float n = (float)profile_count;
 
         RCLCPP_INFO(get_logger(),
-            "Frame %d: %.1fHz, disp=[%.1f, %.1f]", frame_count_, fps, d_min, d_max);
+            "Frame %d: %.1fHz (sync seq %lu, dropped ~%ld), disp=[%.1f, %.1f]",
+            frame_count_, fps, last_seq, dropped, d_min, d_max);
         RCLCPP_INFO(get_logger(),
             "  GPU avg: H2D=%.2f  preproc=%.2f  feat_trt=%.2f  post_trt=%.2f  "
             "cvt=%.2f  blur=%.2f  ema=%.2f  d2h=%.2f  TOTAL=%.2f ms",
@@ -404,6 +414,8 @@ private:
 
     cudaMallocHost(&pin_left_, input_h_ * input_w_);
     cudaMallocHost(&pin_right_, input_h_ * input_w_);
+    cudaMallocHost(&snap_left_, input_h_ * input_w_);
+    cudaMallocHost(&snap_right_, input_h_ * input_w_);
     cudaMalloc(&gpu_left_raw_, input_h_ * input_w_);
     cudaMalloc(&gpu_right_raw_, input_h_ * input_w_);
     cudaMalloc(&buf_left_, 3 * N * sizeof(float));
@@ -419,6 +431,7 @@ private:
 
   void free_buffers() {
     cudaFreeHost(pin_left_); cudaFreeHost(pin_right_);
+    cudaFreeHost(snap_left_); cudaFreeHost(snap_right_);
     cudaFree(gpu_left_raw_); cudaFree(gpu_right_raw_);
     cudaFree(buf_left_); cudaFree(buf_right_);
     cudaFree(disp_f32_); cudaFree(blur_temp_); cudaFree(ema_buf_);
@@ -459,6 +472,8 @@ private:
   // GPU buffers
   uint8_t* pin_left_ = nullptr;
   uint8_t* pin_right_ = nullptr;
+  uint8_t* snap_left_ = nullptr;
+  uint8_t* snap_right_ = nullptr;
   uint8_t* gpu_left_raw_ = nullptr;
   uint8_t* gpu_right_raw_ = nullptr;
   float* buf_left_ = nullptr;
@@ -482,7 +497,8 @@ private:
   cudaStream_t stream_;
 
   // Threading
-  std::atomic<bool> has_left_{false}, has_right_{false}, running_{false};
+  uint64_t stereo_seq_{0};  // guarded by mtx_
+  std::atomic<bool> running_{false};
   bool first_frame_;
   int frame_count_;
   std::mutex mtx_;
@@ -490,7 +506,9 @@ private:
   std::thread infer_thread_;
 
   // ROS2
-  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_left_, sub_right_;
+  message_filters::Subscriber<sensor_msgs::msg::Image> sub_left_, sub_right_;
+  std::shared_ptr<message_filters::TimeSynchronizer<
+      sensor_msgs::msg::Image, sensor_msgs::msg::Image>> sync_;
   rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr pub_gray_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_depth_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_pcl_;
@@ -499,7 +517,9 @@ private:
 int main(int argc, char** argv) {
   rclcpp::init(argc, argv);
   auto node = std::make_shared<LiveFfsNode>();
-  rclcpp::spin(node);
+  rclcpp::executors::MultiThreadedExecutor exec(rclcpp::ExecutorOptions(), 2);
+  exec.add_node(node);
+  exec.spin();
   rclcpp::shutdown();
   return 0;
 }
