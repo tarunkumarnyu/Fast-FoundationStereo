@@ -3,7 +3,7 @@ os.environ['TORCH_COMPILE_DISABLE'] = '1'
 os.environ['TORCHDYNAMO_DISABLE'] = '1'
 code_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(f'{code_dir}/../')
-import omegaconf, yaml, torch,pdb
+import omegaconf, yaml, torch, torch.nn as nn, pdb
 from omegaconf import OmegaConf
 from core.foundation_stereo import FastFoundationStereo, TrtFeatureRunner, TrtPostRunner, build_gwc_volume_triton
 import Utils as U
@@ -19,6 +19,23 @@ class FoundationStereoOnnx(FastFoundationStereo):
         with torch.amp.autocast('cuda', enabled=True, dtype=U.AMP_DTYPE):
             disp = FastFoundationStereo.forward(self, left, right, iters=self.args.valid_iters, test_mode=True, optimize_build_volume=False)
         return disp
+
+
+class SingleOnnxRunner(nn.Module):
+    """Wraps full model into single ONNX: (left, right) → disp."""
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    @torch.no_grad()
+    def forward(self, left, right):
+        with torch.amp.autocast('cuda', enabled=True, dtype=U.AMP_DTYPE):
+            return self.model(
+                left, right,
+                iters=self.model.args.valid_iters,
+                test_mode=True,
+                optimize_build_volume='onnx_safe',
+            )
 
 
 
@@ -37,8 +54,12 @@ if __name__ == '__main__':
     parser.add_argument('--n_gru_layers', type=int, default=1, help="number of hidden GRU levels")
     parser.add_argument('--max_disp', type=int, default=192, help="max disp of geometry encoding volume")
     parser.add_argument('--low_memory', type=int, default=1, help='reduce memory usage')
+    parser.add_argument('--single_onnx', action='store_true',
+                        help='Export the full model to a single ONNX file (left,right -> disp)')
+    parser.add_argument('--single_onnx_name', type=str, default='foundation_stereo.onnx',
+                        help='Filename for the single-model ONNX export')
     args = parser.parse_args()
-    os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
+    os.makedirs(args.save_path, exist_ok=True)
 
     torch.autograd.set_grad_enabled(False)
 
@@ -83,4 +104,25 @@ if __name__ == '__main__':
     )
 
     with open(f'{args.save_path}/onnx.yaml', 'w') as f:
-      yaml.safe_dump(OmegaConf.to_container(model.args), f)
+      cfg = OmegaConf.to_container(model.args)
+      cfg['image_size'] = [args.height, args.width]
+      cfg['cv_group'] = model.cv_group
+      if args.single_onnx:
+        cfg['single_onnx'] = True
+      yaml.safe_dump(cfg, f)
+
+    if args.single_onnx:
+      print(f"\nExporting single ONNX: {args.single_onnx_name} ...")
+      single_runner = SingleOnnxRunner(model).cuda().eval()
+      torch.onnx.export(
+          single_runner,
+          (left_img, right_img),
+          os.path.join(args.save_path, args.single_onnx_name),
+          opset_version=17,
+          input_names=['left', 'right'],
+          output_names=['disp'],
+          do_constant_folding=True,
+      )
+      print(f"Single ONNX saved: {args.save_path}/{args.single_onnx_name}")
+      print(f"Build TRT engine:")
+      print(f"  trtexec --onnx={args.save_path}/{args.single_onnx_name} --saveEngine={args.save_path}/foundation_stereo.engine --fp16")

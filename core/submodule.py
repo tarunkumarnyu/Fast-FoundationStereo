@@ -503,6 +503,43 @@ def build_concat_volume_optimized_pytorch1(refimg_fea, targetimg_fea, maxdisp:in
 
 
 
+def build_gwc_volume_onnx_safe(refimg_fea: torch.Tensor, targetimg_fea: torch.Tensor, maxdisp: int, num_groups: int, normalize=True):
+    """Pure loop-based GWC — ONNX-safe (no unfold/flip)."""
+    B, C, H, W = refimg_fea.shape
+    cpg = C // num_groups
+    ref = refimg_fea.view(B, num_groups, cpg, H, W)
+    volume = torch.zeros(B, num_groups, maxdisp, H, W,
+                         device=refimg_fea.device, dtype=refimg_fea.dtype)
+    for d in range(maxdisp):
+        if d == 0:
+            tar_shifted = targetimg_fea
+        else:
+            tar_shifted = F.pad(targetimg_fea[:, :, :, :-d], (d, 0))
+        tar = tar_shifted.view(B, num_groups, cpg, H, W)
+        if normalize:
+            ref_n = F.normalize(ref.float(), dim=2).to(refimg_fea.dtype)
+            tar_n = F.normalize(tar.float(), dim=2).to(refimg_fea.dtype)
+            volume[:, :, d, :, :] = (ref_n * tar_n).sum(dim=2)
+        else:
+            volume[:, :, d, :, :] = (ref * tar).sum(dim=2)
+    return volume.contiguous()
+
+
+def build_concat_volume_onnx_safe(refimg_fea, targetimg_fea, maxdisp: int):
+    """Pure loop-based concat volume — ONNX-safe (no unfold/flip)."""
+    B, C, H, W = refimg_fea.shape
+    ref_volume = refimg_fea.unsqueeze(2).expand(B, C, maxdisp, H, W)
+    shifted_list = []
+    for d in range(maxdisp):
+        if d == 0:
+            shifted_list.append(targetimg_fea)
+        else:
+            shifted_list.append(F.pad(targetimg_fea[:, :, :, :-d], (d, 0)))
+    target_volume = torch.stack(shifted_list, dim=2)
+    volume = torch.cat((ref_volume, target_volume), dim=1)
+    return volume.contiguous()
+
+
 def disparity_regression(x, maxdisp):
     assert len(x.shape) == 4
     disp_values = torch.arange(0, maxdisp, dtype=x.dtype, device=x.device)
@@ -618,8 +655,8 @@ class ChannelAttentionEnhancement(nn.Module):
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        avg_out = self.fc(self.avg_pool(x))
-        max_out = self.fc(self.max_pool(x))
+        avg_out = self.fc(torch.mean(x, dim=(2, 3), keepdim=True))
+        max_out = self.fc(torch.amax(x, dim=(2, 3), keepdim=True))
         out = avg_out + max_out
         return self.sigmoid(out)
 

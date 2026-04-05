@@ -1,6 +1,8 @@
 /**
  * C++ Fast-FoundationStereo ROS2 node — unified pipeline.
- * Two TRT engines: feature_runner → post_gwc_runner → disparity.
+ * Supports two modes:
+ *   - Two TRT engines: feature_runner → post_gwc_runner → disparity.
+ *   - Single TRT engine: foundation_stereo (left, right → disp).
  * Per-stage CUDA event profiling.
  * Publishes: compressed disparity, float32 depth, PointCloud2 (for validation).
  */
@@ -63,9 +65,11 @@ public:
     W_ = yaml["image_size"][1].as<int>();
     max_disp_ = yaml["max_disp"].as<int>(128);
     bool unified = yaml["unified_post"].as<bool>(false);
+    single_engine_ = yaml["single_onnx"].as<bool>(false);
     int iters = yaml["valid_iters"].as<int>(8);
-    RCLCPP_INFO(get_logger(), "Config: %dx%d, %d iters, unified=%s",
-                W_, H_, iters, unified ? "true" : "false");
+    RCLCPP_INFO(get_logger(), "Config: %dx%d, %d iters, unified=%s, single=%s",
+                W_, H_, iters, unified ? "true" : "false",
+                single_engine_ ? "true" : "false");
 
     // Depth conversion — scale intrinsics to engine resolution
     int native_w = get_parameter("native_w").as_int();
@@ -85,13 +89,19 @@ public:
     RCLCPP_INFO(get_logger(), "Depth: zfar=%.1fm, zmin=%.2fm, fb=%.2f", zfar_, zmin_, fb_);
 
     // Load TRT engines
-    feat_engine_ = std::make_unique<fast_ffs::TrtEngine>(engine_dir + "/feature_runner.engine");
-    std::string post_name = unified ? "post_gwc_runner.engine" : "post_runner.engine";
-    post_engine_ = std::make_unique<fast_ffs::TrtEngine>(engine_dir + "/" + post_name);
-
-    // Check disp output dtype
-    auto disp_info = post_engine_->getTensorInfo("disp");
-    disp_is_fp16_ = (disp_info.dtype == nvinfer1::DataType::kHALF);
+    if (single_engine_) {
+      single_engine_ptr_ = std::make_unique<fast_ffs::TrtEngine>(
+          engine_dir + "/foundation_stereo.engine");
+      auto disp_info = single_engine_ptr_->getTensorInfo("disp");
+      disp_is_fp16_ = (disp_info.dtype == nvinfer1::DataType::kHALF);
+      RCLCPP_INFO(get_logger(), "Loaded single engine (left,right -> disp)");
+    } else {
+      feat_engine_ = std::make_unique<fast_ffs::TrtEngine>(engine_dir + "/feature_runner.engine");
+      std::string post_name = unified ? "post_gwc_runner.engine" : "post_runner.engine";
+      post_engine_ = std::make_unique<fast_ffs::TrtEngine>(engine_dir + "/" + post_name);
+      auto disp_info = post_engine_->getTensorInfo("disp");
+      disp_is_fp16_ = (disp_info.dtype == nvinfer1::DataType::kHALF);
+    }
 
     // Allocate GPU/host buffers
     alloc_buffers();
@@ -106,13 +116,26 @@ public:
     warmup();
 
     // ROS2 subscribers — time-synchronized stereo pair
+    declare_parameter("compressed", false);
+    compressed_ = get_parameter("compressed").as_bool();
+
     auto qos = rclcpp::QoS(1).best_effort();
-    sub_left_.subscribe(this, ns + "/infra1/image_rect_raw", qos.get_rmw_qos_profile());
-    sub_right_.subscribe(this, ns + "/infra2/image_rect_raw", qos.get_rmw_qos_profile());
-    sync_ = std::make_shared<message_filters::TimeSynchronizer<
-        sensor_msgs::msg::Image, sensor_msgs::msg::Image>>(sub_left_, sub_right_, 2);
-    sync_->registerCallback(std::bind(&LiveFfsNode::cb_stereo, this,
-        std::placeholders::_1, std::placeholders::_2));
+    if (compressed_) {
+      RCLCPP_INFO(get_logger(), "Subscribing to COMPRESSED topics");
+      sub_left_c_.subscribe(this, ns + "/infra1/image_rect_raw/compressed", qos.get_rmw_qos_profile());
+      sub_right_c_.subscribe(this, ns + "/infra2/image_rect_raw/compressed", qos.get_rmw_qos_profile());
+      sync_c_ = std::make_shared<message_filters::TimeSynchronizer<
+          sensor_msgs::msg::CompressedImage, sensor_msgs::msg::CompressedImage>>(sub_left_c_, sub_right_c_, 2);
+      sync_c_->registerCallback(std::bind(&LiveFfsNode::cb_stereo_compressed, this,
+          std::placeholders::_1, std::placeholders::_2));
+    } else {
+      sub_left_.subscribe(this, ns + "/infra1/image_rect_raw", qos.get_rmw_qos_profile());
+      sub_right_.subscribe(this, ns + "/infra2/image_rect_raw", qos.get_rmw_qos_profile());
+      sync_ = std::make_shared<message_filters::TimeSynchronizer<
+          sensor_msgs::msg::Image, sensor_msgs::msg::Image>>(sub_left_, sub_right_, 2);
+      sync_->registerCallback(std::bind(&LiveFfsNode::cb_stereo, this,
+          std::placeholders::_1, std::placeholders::_2));
+    }
 
     // Publishers
     auto pub_qos = rclcpp::QoS(1).reliable();
@@ -145,28 +168,47 @@ public:
   }
 
 private:
+  void set_input_size(int h, int w) {
+    if (input_h_ == h && input_w_ == w) return;
+    if (input_h_ != 0) {
+      cudaFreeHost(pin_left_); cudaFreeHost(pin_right_);
+      cudaFreeHost(snap_left_); cudaFreeHost(snap_right_);
+      cudaFree(gpu_left_raw_); cudaFree(gpu_right_raw_);
+    }
+    input_h_ = h; input_w_ = w;
+    cudaMallocHost(&pin_left_, input_h_ * input_w_);
+    cudaMallocHost(&pin_right_, input_h_ * input_w_);
+    cudaMallocHost(&snap_left_, input_h_ * input_w_);
+    cudaMallocHost(&snap_right_, input_h_ * input_w_);
+    cudaMalloc(&gpu_left_raw_, input_h_ * input_w_);
+    cudaMalloc(&gpu_right_raw_, input_h_ * input_w_);
+    RCLCPP_INFO(get_logger(), "Input: %dx%d", input_w_, input_h_);
+  }
+
   void cb_stereo(const sensor_msgs::msg::Image::ConstSharedPtr& left_msg,
                  const sensor_msgs::msg::Image::ConstSharedPtr& right_msg) {
-    if (input_h_ == 0) {
-      input_h_ = left_msg->height;
-      input_w_ = left_msg->width;
-      if (input_h_ * input_w_ != 480 * 848) {
-        cudaFreeHost(pin_left_); cudaFreeHost(pin_right_);
-        cudaFreeHost(snap_left_); cudaFreeHost(snap_right_);
-        cudaFree(gpu_left_raw_); cudaFree(gpu_right_raw_);
-        cudaMallocHost(&pin_left_, input_h_ * input_w_);
-        cudaMallocHost(&pin_right_, input_h_ * input_w_);
-        cudaMallocHost(&snap_left_, input_h_ * input_w_);
-        cudaMallocHost(&snap_right_, input_h_ * input_w_);
-        cudaMalloc(&gpu_left_raw_, input_h_ * input_w_);
-        cudaMalloc(&gpu_right_raw_, input_h_ * input_w_);
-      }
-      RCLCPP_INFO(get_logger(), "Input: %dx%d", input_w_, input_h_);
-    }
+    set_input_size(left_msg->height, left_msg->width);
     {
       std::lock_guard<std::mutex> lock(mtx_);
       std::memcpy(pin_left_, left_msg->data.data(), left_msg->data.size());
       std::memcpy(pin_right_, right_msg->data.data(), right_msg->data.size());
+      stereo_seq_++;
+    }
+    frame_cv_.notify_one();
+  }
+
+  void cb_stereo_compressed(const sensor_msgs::msg::CompressedImage::ConstSharedPtr& left_msg,
+                            const sensor_msgs::msg::CompressedImage::ConstSharedPtr& right_msg) {
+    // Decompress JPEG/PNG to grayscale
+    cv::Mat left_dec = cv::imdecode(left_msg->data, cv::IMREAD_GRAYSCALE);
+    cv::Mat right_dec = cv::imdecode(right_msg->data, cv::IMREAD_GRAYSCALE);
+    if (left_dec.empty() || right_dec.empty()) return;
+
+    set_input_size(left_dec.rows, left_dec.cols);
+    {
+      std::lock_guard<std::mutex> lock(mtx_);
+      std::memcpy(pin_left_, left_dec.data, input_h_ * input_w_);
+      std::memcpy(pin_right_, right_dec.data, input_h_ * input_w_);
       stereo_seq_++;
     }
     frame_cv_.notify_one();
@@ -214,26 +256,34 @@ private:
                                 input_h_, input_w_, H_, W_, stream_);
       cudaEventRecord(events_[2], stream_);
 
-      // Feature engine
-      feat_engine_->infer({{"left", buf_left_}, {"right", buf_right_}}, stream_);
-      cudaEventRecord(events_[3], stream_);
+      void* disp_raw_ptr = nullptr;
+      if (single_engine_) {
+        // Single engine: (left, right) → disp
+        cudaEventRecord(events_[3], stream_);  // no separate feature stage
+        single_engine_ptr_->infer({{"left", buf_left_}, {"right", buf_right_}}, stream_);
+        disp_raw_ptr = single_engine_ptr_->getOutputPtr("disp");
+      } else {
+        // Two-engine: feature → post+GWC
+        feat_engine_->infer({{"left", buf_left_}, {"right", buf_right_}}, stream_);
+        cudaEventRecord(events_[3], stream_);
 
-      // Post+GWC engine
-      std::map<std::string, void*> post_inputs;
-      for (auto& info : post_engine_->getInputInfos()) {
-        void* ptr = feat_engine_->getOutputPtr(info.name);
-        if (ptr) post_inputs[info.name] = ptr;
+        std::map<std::string, void*> post_inputs;
+        for (auto& info : post_engine_->getInputInfos()) {
+          void* ptr = feat_engine_->getOutputPtr(info.name);
+          if (ptr) post_inputs[info.name] = ptr;
+        }
+        post_engine_->infer(post_inputs, stream_);
+        disp_raw_ptr = post_engine_->getOutputPtr("disp");
       }
-      post_engine_->infer(post_inputs, stream_);
       cudaEventRecord(events_[4], stream_);
 
       // fp16→fp32 if needed
       if (disp_is_fp16_) {
         fast_ffs::half_to_float(
-            (const __half*)post_engine_->getOutputPtr("disp"),
+            (const __half*)disp_raw_ptr,
             disp_f32_, N, stream_);
       } else {
-        cudaMemcpyAsync(disp_f32_, post_engine_->getOutputPtr("disp"),
+        cudaMemcpyAsync(disp_f32_, disp_raw_ptr,
                          N * sizeof(float), cudaMemcpyDeviceToDevice, stream_);
       }
       cudaEventRecord(events_[5], stream_);
@@ -409,15 +459,17 @@ private:
   }
 
   void alloc_buffers() {
-    input_h_ = 480; input_w_ = 848;
+    int default_h = 480, default_w = 848;
     int N = H_ * W_;
 
-    cudaMallocHost(&pin_left_, input_h_ * input_w_);
-    cudaMallocHost(&pin_right_, input_h_ * input_w_);
-    cudaMallocHost(&snap_left_, input_h_ * input_w_);
-    cudaMallocHost(&snap_right_, input_h_ * input_w_);
-    cudaMalloc(&gpu_left_raw_, input_h_ * input_w_);
-    cudaMalloc(&gpu_right_raw_, input_h_ * input_w_);
+    // Pre-allocate input buffers for default camera resolution
+    input_h_ = default_h; input_w_ = default_w;
+    cudaMallocHost(&pin_left_, default_h * default_w);
+    cudaMallocHost(&pin_right_, default_h * default_w);
+    cudaMallocHost(&snap_left_, default_h * default_w);
+    cudaMallocHost(&snap_right_, default_h * default_w);
+    cudaMalloc(&gpu_left_raw_, default_h * default_w);
+    cudaMalloc(&gpu_right_raw_, default_h * default_w);
     cudaMalloc(&buf_left_, 3 * N * sizeof(float));
     cudaMalloc(&buf_right_, 3 * N * sizeof(float));
     cudaMalloc(&disp_f32_, N * sizeof(float));
@@ -443,16 +495,21 @@ private:
     cudaMemset(buf_left_, 0, 3 * H_ * W_ * sizeof(float));
     cudaMemset(buf_right_, 0, 3 * H_ * W_ * sizeof(float));
     for (int i = 0; i < 3; ++i) {
-      feat_engine_->infer({{"left", buf_left_}, {"right", buf_right_}}, stream_);
-      cudaStreamSynchronize(stream_);
+      if (single_engine_) {
+        single_engine_ptr_->infer({{"left", buf_left_}, {"right", buf_right_}}, stream_);
+        cudaStreamSynchronize(stream_);
+      } else {
+        feat_engine_->infer({{"left", buf_left_}, {"right", buf_right_}}, stream_);
+        cudaStreamSynchronize(stream_);
 
-      std::map<std::string, void*> post_inputs;
-      for (auto& info : post_engine_->getInputInfos()) {
-        void* ptr = feat_engine_->getOutputPtr(info.name);
-        if (ptr) post_inputs[info.name] = ptr;
+        std::map<std::string, void*> post_inputs;
+        for (auto& info : post_engine_->getInputInfos()) {
+          void* ptr = feat_engine_->getOutputPtr(info.name);
+          if (ptr) post_inputs[info.name] = ptr;
+        }
+        post_engine_->infer(post_inputs, stream_);
+        cudaStreamSynchronize(stream_);
       }
-      post_engine_->infer(post_inputs, stream_);
-      cudaStreamSynchronize(stream_);
     }
     RCLCPP_INFO(get_logger(), "Warmup done");
   }
@@ -461,6 +518,8 @@ private:
   int H_, W_, max_disp_;
   int input_h_ = 0, input_w_ = 0;
   bool disp_is_fp16_ = false;
+  bool single_engine_ = false;
+  bool compressed_ = false;
 
   // Intrinsics (scaled to engine resolution)
   double fx_, fy_, cx_, cy_;
@@ -468,6 +527,7 @@ private:
 
   // TRT engines
   std::unique_ptr<fast_ffs::TrtEngine> feat_engine_, post_engine_;
+  std::unique_ptr<fast_ffs::TrtEngine> single_engine_ptr_;
 
   // GPU buffers
   uint8_t* pin_left_ = nullptr;
@@ -505,10 +565,14 @@ private:
   std::condition_variable frame_cv_;
   std::thread infer_thread_;
 
-  // ROS2
+  // ROS2 — raw subscribers
   message_filters::Subscriber<sensor_msgs::msg::Image> sub_left_, sub_right_;
   std::shared_ptr<message_filters::TimeSynchronizer<
       sensor_msgs::msg::Image, sensor_msgs::msg::Image>> sync_;
+  // ROS2 — compressed subscribers
+  message_filters::Subscriber<sensor_msgs::msg::CompressedImage> sub_left_c_, sub_right_c_;
+  std::shared_ptr<message_filters::TimeSynchronizer<
+      sensor_msgs::msg::CompressedImage, sensor_msgs::msg::CompressedImage>> sync_c_;
   rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr pub_gray_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_depth_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_pcl_;
