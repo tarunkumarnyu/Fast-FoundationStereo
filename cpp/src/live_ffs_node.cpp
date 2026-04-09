@@ -15,6 +15,7 @@
 #include <cstring>
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
@@ -115,6 +116,13 @@ public:
     // Warmup
     warmup();
 
+    // CUDA Graph capture (single-engine only, after warmup so TRT is settled)
+    declare_parameter("use_cuda_graph", true);
+    use_cuda_graph_ = get_parameter("use_cuda_graph").as_bool() && single_engine_;
+    if (use_cuda_graph_) {
+      capture_inference_graph();
+    }
+
     // ROS2 subscribers — time-synchronized stereo pair
     declare_parameter("compressed", false);
     compressed_ = get_parameter("compressed").as_bool();
@@ -141,9 +149,15 @@ public:
     auto pub_qos = rclcpp::QoS(1).reliable();
     pub_gray_ = create_publisher<sensor_msgs::msg::CompressedImage>(
         "/ffs/disp_gray/compressed", pub_qos);
+    // Raw mono8 disparity for rqt_image_view (no image_transport plugin needed)
+    pub_gray_raw_ = create_publisher<sensor_msgs::msg::Image>(
+        "/ffs/disp_gray", pub_qos);
     auto depth_qos = rclcpp::QoS(1).best_effort();
     pub_depth_ = create_publisher<sensor_msgs::msg::Image>(
         "/ffs/depth_raw", depth_qos);
+    // PNG-compressed depth (mm in uint16) for Foxglove / standard ROS tooling
+    pub_depth_compressed_ = create_publisher<sensor_msgs::msg::CompressedImage>(
+        "/ffs/depth/image_rect_raw/compressedDepth", pub_qos);
     pub_pcl_ = create_publisher<sensor_msgs::msg::PointCloud2>(
         "/ffs/pointcloud", depth_qos);
 
@@ -160,6 +174,8 @@ public:
     running_ = false;
     frame_cv_.notify_all();
     if (infer_thread_.joinable()) infer_thread_.join();
+    if (graph_exec_) cudaGraphExecDestroy(graph_exec_);
+    if (graph_) cudaGraphDestroy(graph_);
     free_buffers();
     cudaStreamDestroy(stream_);
     for (int i = 0; i < NUM_EVENTS; ++i) {
@@ -242,61 +258,74 @@ private:
       // === EVENT 0: start ===
       cudaEventRecord(events_[0], stream_);
 
-      // H2D from snapshot (lock-free)
-      cudaMemcpyAsync(gpu_left_raw_, snap_left_, input_h_ * input_w_,
-                       cudaMemcpyHostToDevice, stream_);
-      cudaMemcpyAsync(gpu_right_raw_, snap_right_, input_h_ * input_w_,
-                       cudaMemcpyHostToDevice, stream_);
-      cudaEventRecord(events_[1], stream_);
-
-      // Preprocess: resize + gray→3ch float32
-      fast_ffs::preprocess_gpu(gpu_left_raw_, buf_left_,
-                                input_h_, input_w_, H_, W_, stream_);
-      fast_ffs::preprocess_gpu(gpu_right_raw_, buf_right_,
-                                input_h_, input_w_, H_, W_, stream_);
-      cudaEventRecord(events_[2], stream_);
-
-      void* disp_raw_ptr = nullptr;
-      if (single_engine_) {
-        // Single engine: (left, right) → disp
-        cudaEventRecord(events_[3], stream_);  // no separate feature stage
-        single_engine_ptr_->infer({{"left", buf_left_}, {"right", buf_right_}}, stream_);
-        disp_raw_ptr = single_engine_ptr_->getOutputPtr("disp");
-      } else {
-        // Two-engine: feature → post+GWC
-        feat_engine_->infer({{"left", buf_left_}, {"right", buf_right_}}, stream_);
+      if (graph_built_) {
+        // Fast path: replay captured graph (single TRT engine + all kernels in one launch)
+        cudaGraphLaunch(graph_exec_, stream_);
+        // Per-stage events skipped — only total is meaningful
+        cudaEventRecord(events_[1], stream_);
+        cudaEventRecord(events_[2], stream_);
         cudaEventRecord(events_[3], stream_);
-
-        std::map<std::string, void*> post_inputs;
-        for (auto& info : post_engine_->getInputInfos()) {
-          void* ptr = feat_engine_->getOutputPtr(info.name);
-          if (ptr) post_inputs[info.name] = ptr;
-        }
-        post_engine_->infer(post_inputs, stream_);
-        disp_raw_ptr = post_engine_->getOutputPtr("disp");
-      }
-      cudaEventRecord(events_[4], stream_);
-
-      // fp16→fp32 if needed
-      if (disp_is_fp16_) {
-        fast_ffs::half_to_float(
-            (const __half*)disp_raw_ptr,
-            disp_f32_, N, stream_);
+        cudaEventRecord(events_[4], stream_);
+        cudaEventRecord(events_[5], stream_);
+        cudaEventRecord(events_[6], stream_);
+        cudaEventRecord(events_[7], stream_);
       } else {
-        cudaMemcpyAsync(disp_f32_, disp_raw_ptr,
-                         N * sizeof(float), cudaMemcpyDeviceToDevice, stream_);
+        // H2D from snapshot (lock-free)
+        cudaMemcpyAsync(gpu_left_raw_, snap_left_, input_h_ * input_w_,
+                         cudaMemcpyHostToDevice, stream_);
+        cudaMemcpyAsync(gpu_right_raw_, snap_right_, input_h_ * input_w_,
+                         cudaMemcpyHostToDevice, stream_);
+        cudaEventRecord(events_[1], stream_);
+
+        // Preprocess: resize + gray→3ch float32
+        fast_ffs::preprocess_gpu(gpu_left_raw_, buf_left_,
+                                  input_h_, input_w_, H_, W_, stream_);
+        fast_ffs::preprocess_gpu(gpu_right_raw_, buf_right_,
+                                  input_h_, input_w_, H_, W_, stream_);
+        cudaEventRecord(events_[2], stream_);
+
+        void* disp_raw_ptr = nullptr;
+        if (single_engine_) {
+          // Single engine: (left, right) → disp
+          cudaEventRecord(events_[3], stream_);  // no separate feature stage
+          single_engine_ptr_->infer({{"left", buf_left_}, {"right", buf_right_}}, stream_);
+          disp_raw_ptr = single_engine_ptr_->getOutputPtr("disp");
+        } else {
+          // Two-engine: feature → post+GWC
+          feat_engine_->infer({{"left", buf_left_}, {"right", buf_right_}}, stream_);
+          cudaEventRecord(events_[3], stream_);
+
+          std::map<std::string, void*> post_inputs;
+          for (auto& info : post_engine_->getInputInfos()) {
+            void* ptr = feat_engine_->getOutputPtr(info.name);
+            if (ptr) post_inputs[info.name] = ptr;
+          }
+          post_engine_->infer(post_inputs, stream_);
+          disp_raw_ptr = post_engine_->getOutputPtr("disp");
+        }
+        cudaEventRecord(events_[4], stream_);
+
+        // fp16→fp32 if needed
+        if (disp_is_fp16_) {
+          fast_ffs::half_to_float(
+              (const __half*)disp_raw_ptr,
+              disp_f32_, N, stream_);
+        } else {
+          cudaMemcpyAsync(disp_f32_, disp_raw_ptr,
+                           N * sizeof(float), cudaMemcpyDeviceToDevice, stream_);
+        }
+        cudaEventRecord(events_[5], stream_);
+
+        // Box blur disabled — raw disparity
+        cudaEventRecord(events_[6], stream_);
+
+        // EMA disabled — pass through
+        cudaEventRecord(events_[7], stream_);
+
+        // D2H
+        cudaMemcpyAsync(disp_host_, disp_f32_, N * sizeof(float),
+                         cudaMemcpyDeviceToHost, stream_);
       }
-      cudaEventRecord(events_[5], stream_);
-
-      // Box blur disabled — raw disparity
-      cudaEventRecord(events_[6], stream_);
-
-      // EMA disabled — pass through
-      cudaEventRecord(events_[7], stream_);
-
-      // D2H + sync
-      cudaMemcpyAsync(disp_host_, disp_f32_, N * sizeof(float),
-                       cudaMemcpyDeviceToHost, stream_);
       cudaStreamSynchronize(stream_);
       cudaEventRecord(events_[8], stream_);
       cudaEventSynchronize(events_[8]);
@@ -342,18 +371,43 @@ private:
       gray_msg.format = "jpeg";
       gray_msg.data.assign(jpeg_buf_.begin(), jpeg_buf_.end());
       pub_gray_->publish(gray_msg);
+
+      // Publish raw mono8 disparity (for rqt_image_view without compressed plugin)
+      if (pub_gray_raw_->get_subscription_count() > 0) {
+        auto raw_msg = sensor_msgs::msg::Image();
+        raw_msg.header.stamp = stamp;
+        raw_msg.header.frame_id = "cam1_infra1_optical_frame";
+        raw_msg.height = H_;
+        raw_msg.width = W_;
+        raw_msg.encoding = "mono8";
+        raw_msg.is_bigendian = false;
+        raw_msg.step = W_;
+        raw_msg.data.assign(gray_host_, gray_host_ + N);
+        pub_gray_raw_->publish(raw_msg);
+      }
       auto cpu_t3 = std::chrono::steady_clock::now();
 
       // Depth + PointCloud (only if subscribed)
       float cpu_depth_ms = 0.0f, cpu_pcl_ms = 0.0f;
       bool pub_depth = pub_depth_->get_subscription_count() > 0;
+      bool pub_dcomp = pub_depth_compressed_->get_subscription_count() > 0;
       bool pub_pcl = pub_pcl_->get_subscription_count() > 0;
 
-      if (pub_depth || pub_pcl) {
-        // Compute depth for all pixels
+      if (pub_depth || pub_dcomp || pub_pcl) {
+        // Compute depth for all pixels.
+        // Invalid pixels (disp <= 0, non-finite, or out of [zmin, zfar]) become NaN.
         for (int i = 0; i < N; ++i) {
-          float d = (float)(fb_ / (double)disp_host_[i]);
-          depth_host_[i] = std::min(std::max(d, (float)zmin_), (float)zfar_);
+          float disp = disp_host_[i];
+          if (!std::isfinite(disp) || disp <= 0.0f) {
+            depth_host_[i] = std::numeric_limits<float>::quiet_NaN();
+            continue;
+          }
+          float d = (float)(fb_ / (double)disp);
+          if (!std::isfinite(d) || d < (float)zmin_ || d > (float)zfar_) {
+            depth_host_[i] = std::numeric_limits<float>::quiet_NaN();
+          } else {
+            depth_host_[i] = d;
+          }
         }
         auto cpu_t4 = std::chrono::steady_clock::now();
         cpu_depth_ms = std::chrono::duration<float, std::milli>(cpu_t4 - cpu_t3).count();
@@ -370,6 +424,34 @@ private:
           depth_msg.data.resize(N * sizeof(float));
           std::memcpy(depth_msg.data.data(), depth_host_, N * sizeof(float));
           pub_depth_->publish(depth_msg);
+        }
+
+        if (pub_dcomp) {
+          // Convert float meters -> uint16 millimeters. NaN -> 0 (invalid).
+          cv::Mat depth_mm(H_, W_, CV_16UC1);
+          uint16_t* dst = depth_mm.ptr<uint16_t>();
+          for (int i = 0; i < N; ++i) {
+            float m = depth_host_[i];
+            if (!std::isfinite(m)) {
+              dst[i] = 0;  // invalid
+              continue;
+            }
+            int mm = (int)(m * 1000.0f + 0.5f);
+            dst[i] = (uint16_t)std::min(std::max(mm, 0), 65535);
+          }
+          // PNG encode
+          std::vector<uchar> png_buf;
+          cv::imencode(".png", depth_mm, png_buf, {cv::IMWRITE_PNG_COMPRESSION, 1});
+
+          auto dmsg = sensor_msgs::msg::CompressedImage();
+          dmsg.header.stamp = stamp;
+          dmsg.header.frame_id = "cam1_infra1_optical_frame";
+          dmsg.format = "16UC1; compressedDepth png";
+          // Standard 12-byte ConfigHeader: format(int32)=0(UNDEFINED), A(float)=0, B(float)=0
+          dmsg.data.resize(12 + png_buf.size());
+          std::memset(dmsg.data.data(), 0, 12);
+          std::memcpy(dmsg.data.data() + 12, png_buf.data(), png_buf.size());
+          pub_depth_compressed_->publish(dmsg);
         }
 
         if (pub_pcl) {
@@ -514,6 +596,68 @@ private:
     RCLCPP_INFO(get_logger(), "Warmup done");
   }
 
+  // Issue the full per-frame ops sequence (used both directly and inside graph capture).
+  // Assumes snap_left_ / snap_right_ contain valid input data.
+  void submit_pipeline() {
+    int N = H_ * W_;
+    // H2D
+    cudaMemcpyAsync(gpu_left_raw_, snap_left_, input_h_ * input_w_,
+                    cudaMemcpyHostToDevice, stream_);
+    cudaMemcpyAsync(gpu_right_raw_, snap_right_, input_h_ * input_w_,
+                    cudaMemcpyHostToDevice, stream_);
+    // Preprocess
+    fast_ffs::preprocess_gpu(gpu_left_raw_, buf_left_,
+                             input_h_, input_w_, H_, W_, stream_);
+    fast_ffs::preprocess_gpu(gpu_right_raw_, buf_right_,
+                             input_h_, input_w_, H_, W_, stream_);
+    // TRT inference (single engine path only — addresses set externally)
+    single_engine_ptr_->infer({{"left", buf_left_}, {"right", buf_right_}}, stream_);
+    void* disp_raw_ptr = single_engine_ptr_->getOutputPtr("disp");
+    // fp16 -> fp32
+    if (disp_is_fp16_) {
+      fast_ffs::half_to_float((const __half*)disp_raw_ptr, disp_f32_, N, stream_);
+    } else {
+      cudaMemcpyAsync(disp_f32_, disp_raw_ptr, N * sizeof(float),
+                      cudaMemcpyDeviceToDevice, stream_);
+    }
+    // D2H
+    cudaMemcpyAsync(disp_host_, disp_f32_, N * sizeof(float),
+                    cudaMemcpyDeviceToHost, stream_);
+  }
+
+  void capture_inference_graph() {
+    RCLCPP_INFO(get_logger(), "Capturing CUDA graph...");
+    // First, do a real run so TRT picks tactics / allocates anything lazy
+    submit_pipeline();
+    cudaStreamSynchronize(stream_);
+
+    // Now begin capture
+    cudaError_t err = cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal);
+    if (err != cudaSuccess) {
+      RCLCPP_WARN(get_logger(), "cudaStreamBeginCapture failed: %s — falling back to direct mode",
+                  cudaGetErrorString(err));
+      use_cuda_graph_ = false;
+      return;
+    }
+    submit_pipeline();
+    err = cudaStreamEndCapture(stream_, &graph_);
+    if (err != cudaSuccess) {
+      RCLCPP_WARN(get_logger(), "cudaStreamEndCapture failed: %s — falling back to direct mode",
+                  cudaGetErrorString(err));
+      use_cuda_graph_ = false;
+      return;
+    }
+    err = cudaGraphInstantiate(&graph_exec_, graph_, nullptr, nullptr, 0);
+    if (err != cudaSuccess) {
+      RCLCPP_WARN(get_logger(), "cudaGraphInstantiate failed: %s — falling back to direct mode",
+                  cudaGetErrorString(err));
+      use_cuda_graph_ = false;
+      return;
+    }
+    graph_built_ = true;
+    RCLCPP_INFO(get_logger(), "CUDA graph captured and instantiated");
+  }
+
   // Config
   int H_, W_, max_disp_;
   int input_h_ = 0, input_w_ = 0;
@@ -556,6 +700,12 @@ private:
   // CUDA
   cudaStream_t stream_;
 
+  // CUDA Graph (single-engine fast path)
+  bool use_cuda_graph_ = false;
+  bool graph_built_ = false;
+  cudaGraph_t graph_ = nullptr;
+  cudaGraphExec_t graph_exec_ = nullptr;
+
   // Threading
   uint64_t stereo_seq_{0};  // guarded by mtx_
   std::atomic<bool> running_{false};
@@ -574,7 +724,9 @@ private:
   std::shared_ptr<message_filters::TimeSynchronizer<
       sensor_msgs::msg::CompressedImage, sensor_msgs::msg::CompressedImage>> sync_c_;
   rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr pub_gray_;
+  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_gray_raw_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_depth_;
+  rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr pub_depth_compressed_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_pcl_;
 };
 
