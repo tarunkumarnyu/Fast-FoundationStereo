@@ -12,7 +12,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from std_msgs.msg import Header
-from sensor_msgs.msg import CompressedImage
+from sensor_msgs.msg import CompressedImage, CameraInfo
 from builtin_interfaces.msg import Time
 from mcap_ros2.reader import read_ros2_messages
 
@@ -31,14 +31,16 @@ class BagPlayerCompressed(Node):
         )
         self.pub_left = self.create_publisher(CompressedImage, f'{ns}/infra1/image_rect_raw/compressed', qos)
         self.pub_right = self.create_publisher(CompressedImage, f'{ns}/infra2/image_rect_raw/compressed', qos)
-        self.get_logger().info(f'Playing {bag_path} at {rate}x (compressed passthrough)')
+        self.pub_rs_depth = self.create_publisher(CompressedImage, f'{ns}/depth/image_rect_raw/compressedDepth', qos)
+        self.get_logger().info(f'Playing {bag_path} at {rate}x (compressed passthrough + RS depth)')
 
     def play(self):
         topic_left = f'{self.ns}/infra1/image_rect_raw/compressed'
         topic_right = f'{self.ns}/infra2/image_rect_raw/compressed'
+        topic_rs_depth = f'{self.ns}/depth/image_rect_raw/compressedDepth'
 
         msgs = []
-        for msg in read_ros2_messages(self.bag_path, topics=[topic_left, topic_right]):
+        for msg in read_ros2_messages(self.bag_path, topics=[topic_left, topic_right, topic_rs_depth]):
             msgs.append((msg.channel.topic, msg.ros_msg, msg.log_time))
 
         if not msgs:
@@ -71,8 +73,10 @@ class BagPlayerCompressed(Node):
             try:
                 if topic == topic_left:
                     self.pub_left.publish(out)
-                else:
+                elif topic == topic_right:
                     self.pub_right.publish(out)
+                elif topic == topic_rs_depth:
+                    self.pub_rs_depth.publish(out)
                 count += 1
             except Exception:
                 break
